@@ -1,0 +1,33 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.egg-info/
+dist/
+build/
+.venv/
+venv/
+env/
+
+# Environment — never commit secrets
+.env
+*.env.local
+
+# Docker / runtime artefacts
+*.log
+.docker/
+
+# Data files
+*.csv
+*.parquet
+data/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+
+# OS
+.DS_Store
+Thumbs.db

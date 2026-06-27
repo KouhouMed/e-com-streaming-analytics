@@ -1,0 +1,80 @@
+version: "3.8"
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Day 1 — Core infrastructure: Kafka (KRaft, no Zookeeper) + PostgreSQL
+# All ports and credentials are read from .env (see .env.example).
+# ──────────────────────────────────────────────────────────────────────────────
+
+services:
+
+  # ── Apache Kafka (single-node KRaft broker + controller) ────────────────────
+  kafka:
+    image: confluentinc/cp-kafka:7.6.0
+    hostname: kafka
+    container_name: kafka
+    ports:
+      # Host access: localhost:9092  (KAFKA_EXTERNAL_PORT)
+      - "${KAFKA_EXTERNAL_PORT:-9092}:9092"
+    environment:
+      # KRaft identity
+      KAFKA_NODE_ID: 1
+      KAFKA_PROCESS_ROLES: "broker,controller"
+      KAFKA_CONTROLLER_QUORUM_VOTERS: "1@kafka:29093"
+      CLUSTER_ID: "${CLUSTER_ID:-4L6g3nShT-eMCtK--X86sw}"
+
+      # Three listeners:
+      #   PLAINTEXT_HOST  → exposed to the Docker host (port 9092)
+      #   PLAINTEXT       → used by other containers inside the Docker network (port 29092)
+      #   CONTROLLER      → internal KRaft controller traffic (port 29093)
+      KAFKA_LISTENERS: "PLAINTEXT_HOST://0.0.0.0:9092,PLAINTEXT://0.0.0.0:29092,CONTROLLER://0.0.0.0:29093"
+      KAFKA_ADVERTISED_LISTENERS: "PLAINTEXT_HOST://localhost:${KAFKA_EXTERNAL_PORT:-9092},PLAINTEXT://kafka:${KAFKA_INTERNAL_PORT:-29092}"
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: "PLAINTEXT:PLAINTEXT,PLAINTEXT_HOST:PLAINTEXT,CONTROLLER:PLAINTEXT"
+      KAFKA_INTER_BROKER_LISTENER_NAME: "PLAINTEXT"
+      KAFKA_CONTROLLER_LISTENER_NAMES: "CONTROLLER"
+
+      # Single-node tuning (replication factor = 1 is safe for local dev)
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+      KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 0
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "true"
+      KAFKA_LOG_DIRS: "/var/lib/kafka/data"
+
+    volumes:
+      - kafka_data:/var/lib/kafka/data
+    healthcheck:
+      test: ["CMD", "kafka-broker-api-versions", "--bootstrap-server", "localhost:9092"]
+      interval: 15s
+      timeout: 10s
+      retries: 10
+      start_period: 30s
+    restart: unless-stopped
+
+  # ── PostgreSQL ───────────────────────────────────────────────────────────────
+  postgres:
+    image: postgres:15-alpine
+    container_name: postgres
+    ports:
+      - "${POSTGRES_PORT:-5432}:5432"
+    environment:
+      POSTGRES_USER: "${POSTGRES_USER:-ecom_user}"
+      POSTGRES_PASSWORD: "${POSTGRES_PASSWORD:-ecom_pass}"
+      POSTGRES_DB: "${POSTGRES_DB:-ecom_db}"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      # init.sql is executed once on first startup
+      - ./db/init.sql:/docker-entrypoint-initdb.d/init.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-ecom_user} -d ${POSTGRES_DB:-ecom_db}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+    restart: unless-stopped
+
+# ── Named volumes (data persists across docker compose down/up) ──────────────
+volumes:
+  kafka_data:
+    driver: local
+  postgres_data:
+    driver: local
