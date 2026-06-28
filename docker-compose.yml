@@ -2,6 +2,7 @@ version: "3.8"
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Day 1 — Core infrastructure: Kafka (KRaft, no Zookeeper) + PostgreSQL
+# Day 2 — Clickstream producer (generator.py)
 # All ports and credentials are read from .env (see .env.example).
 # ──────────────────────────────────────────────────────────────────────────────
 
@@ -71,6 +72,24 @@ services:
       retries: 5
       start_period: 10s
     restart: unless-stopped
+
+  # ── Clickstream event producer ───────────────────────────────────────────────
+  producer:
+    build:
+      context: ./producer
+      dockerfile: Dockerfile
+    container_name: producer
+    depends_on:
+      kafka:
+        condition: service_healthy
+    environment:
+      # Containers reach Kafka on the internal listener (kafka:29092)
+      KAFKA_BOOTSTRAP_SERVERS: "kafka:${KAFKA_INTERNAL_PORT:-29092}"
+      KAFKA_TOPIC_CLICKSTREAM: "${KAFKA_TOPIC_CLICKSTREAM:-ecom.clickstream}"
+      EVENTS_PER_SECOND: "${EVENTS_PER_SECOND:-5}"
+      KAFKA_STARTUP_RETRIES: "${KAFKA_STARTUP_RETRIES:-10}"
+      KAFKA_STARTUP_RETRY_DELAY: "${KAFKA_STARTUP_RETRY_DELAY:-3}"
+    restart: on-failure
 
 # ── Named volumes (data persists across docker compose down/up) ──────────────
 volumes:
