@@ -3,6 +3,7 @@ version: "3.8"
 # ──────────────────────────────────────────────────────────────────────────────
 # Day 1 — Core infrastructure: Kafka (KRaft, no Zookeeper) + PostgreSQL
 # Day 2 — Clickstream producer (generator.py)
+# Day 3 — Spark master + worker + stream-processor (console sink)
 # All ports and credentials are read from .env (see .env.example).
 # ──────────────────────────────────────────────────────────────────────────────
 
@@ -73,6 +74,85 @@ services:
       start_period: 10s
     restart: unless-stopped
 
+  # ── Spark Master ─────────────────────────────────────────────────────────────
+  spark-master:
+    build:
+      context: ./consumer
+      dockerfile: Dockerfile
+    container_name: spark-master
+    environment:
+      SPARK_MODE: master
+      SPARK_RPC_AUTHENTICATION_ENABLED: "no"
+      SPARK_RPC_ENCRYPTION_ENABLED: "no"
+    ports:
+      - "${SPARK_MASTER_UI_PORT:-8080}:8080"   # Spark Web UI
+      - "7077:7077"                              # Spark master RPC port
+    healthcheck:
+      test: ["CMD", "curl", "-sf", "http://localhost:8080"]
+      interval: 15s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+    restart: unless-stopped
+
+  # ── Spark Worker ──────────────────────────────────────────────────────────────
+  spark-worker:
+    build:
+      context: ./consumer
+      dockerfile: Dockerfile
+    container_name: spark-worker
+    depends_on:
+      spark-master:
+        condition: service_healthy
+    environment:
+      SPARK_MODE: worker
+      SPARK_MASTER_URL: "spark://spark-master:7077"
+      SPARK_WORKER_MEMORY: "${SPARK_WORKER_MEMORY:-2G}"
+      SPARK_WORKER_CORES: "${SPARK_WORKER_CORES:-2}"
+      SPARK_RPC_AUTHENTICATION_ENABLED: "no"
+      SPARK_RPC_ENCRYPTION_ENABLED: "no"
+    ports:
+      - "${SPARK_WORKER_UI_PORT:-8081}:8081"   # Worker Web UI
+    restart: unless-stopped
+
+  # ── Stream Processor (spark-submit client) ────────────────────────────────────
+  # Submits stream_processor.py to the Spark cluster in client-deploy mode.
+  # The script is volume-mounted so edits take effect on the next container restart
+  # without a full image rebuild.
+  stream-processor:
+    build:
+      context: ./consumer
+      dockerfile: Dockerfile
+    container_name: stream-processor
+    depends_on:
+      kafka:
+        condition: service_healthy
+      spark-master:
+        condition: service_healthy
+    environment:
+      KAFKA_BOOTSTRAP_SERVERS: "kafka:${KAFKA_INTERNAL_PORT:-29092}"
+      KAFKA_TOPIC_CLICKSTREAM:  "${KAFKA_TOPIC_CLICKSTREAM:-ecom.clickstream}"
+      TRIGGER_INTERVAL_SECS:    "${TRIGGER_INTERVAL_SECS:-5}"
+      CHECKPOINT_DIR:           "/tmp/spark-checkpoints/console"
+    volumes:
+      - ./consumer:/opt/spark/jobs     # mount scripts without rebuild
+      - spark_checkpoints:/tmp/spark-checkpoints
+    # Override the bitnami entrypoint to run spark-submit directly
+    entrypoint: ["/opt/bitnami/spark/bin/spark-submit"]
+    command:
+      - "--master"
+      - "spark://spark-master:7077"
+      - "--deploy-mode"
+      - "client"
+      - "--conf"
+      - "spark.driver.host=stream-processor"   # advertise this container's hostname to workers
+      - "--conf"
+      - "spark.driver.bindAddress=0.0.0.0"
+      - "/opt/spark/jobs/stream_processor.py"
+    ports:
+      - "4040:4040"    # Spark application UI
+    restart: on-failure
+
   # ── Clickstream event producer ───────────────────────────────────────────────
   producer:
     build:
@@ -96,4 +176,6 @@ volumes:
   kafka_data:
     driver: local
   postgres_data:
+    driver: local
+  spark_checkpoints:
     driver: local

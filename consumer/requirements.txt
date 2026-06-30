@@ -1,0 +1,5 @@
+# pyspark is provided by the bitnami/spark base image — do not add it here.
+# Add pure-Python dependencies for PySpark jobs as the project grows.
+
+# Day 4+: PostgreSQL writer
+# psycopg2-binary==2.9.9
