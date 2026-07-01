@@ -4,6 +4,7 @@ version: "3.8"
 # Day 1 — Core infrastructure: Kafka (KRaft, no Zookeeper) + PostgreSQL
 # Day 2 — Clickstream producer (generator.py)
 # Day 3 — Spark master + worker + stream-processor (console sink)
+# Day 4 — Windowed aggregations with watermark (revenue + action counts)
 # All ports and credentials are read from .env (see .env.example).
 # ──────────────────────────────────────────────────────────────────────────────
 
@@ -131,9 +132,14 @@ services:
         condition: service_healthy
     environment:
       KAFKA_BOOTSTRAP_SERVERS: "kafka:${KAFKA_INTERNAL_PORT:-29092}"
-      KAFKA_TOPIC_CLICKSTREAM:  "${KAFKA_TOPIC_CLICKSTREAM:-ecom.clickstream}"
-      TRIGGER_INTERVAL_SECS:    "${TRIGGER_INTERVAL_SECS:-5}"
-      CHECKPOINT_DIR:           "/tmp/spark-checkpoints/console"
+      KAFKA_TOPIC_CLICKSTREAM: "${KAFKA_TOPIC_CLICKSTREAM:-ecom.clickstream}"
+      TRIGGER_INTERVAL_SECS:   "${TRIGGER_INTERVAL_SECS:-10}"
+      CHECKPOINT_DIR:          "/tmp/spark-checkpoints"
+      # Watermark & window durations — lower WATERMARK_DURATION in dev for faster output
+      WATERMARK_DURATION:        "${WATERMARK_DURATION:-10 minutes}"
+      REVENUE_WINDOW_DURATION:   "${REVENUE_WINDOW_DURATION:-1 minute}"
+      ACTIVITY_WINDOW_DURATION:  "${ACTIVITY_WINDOW_DURATION:-5 minutes}"
+      ACTIVITY_SLIDE_DURATION:   "${ACTIVITY_SLIDE_DURATION:-1 minute}"
     volumes:
       - ./consumer:/opt/spark/jobs     # mount scripts without rebuild
       - spark_checkpoints:/tmp/spark-checkpoints
