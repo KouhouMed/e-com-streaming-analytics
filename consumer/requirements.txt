@@ -1,5 +1,4 @@
 # pyspark is provided by the bitnami/spark base image — do not add it here.
-# Add pure-Python dependencies for PySpark jobs as the project grows.
 
-# Day 4+: PostgreSQL writer
-# psycopg2-binary==2.9.9
+# Day 5: PostgreSQL writer used inside foreachBatch (driver-only, not on executors)
+psycopg2-binary==2.9.9

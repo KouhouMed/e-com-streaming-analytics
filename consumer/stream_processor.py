@@ -1,38 +1,43 @@
 """
-Day 4 — Real-time windowed aggregations with late-data handling.
+Day 5 — Windowed aggregations persisted to PostgreSQL.
 
-Two streaming queries run concurrently against the same Kafka topic:
+Architecture
+────────────
+Both streaming queries from Day 4 now sink into the ecom schema via
+foreachBatch + psycopg2 upserts, replacing the console-only output:
 
-  Query 1 — revenue_per_minute
-    Tumbling 1-minute windows over purchase events.
-    Computes total revenue and purchase count per window.
+  ecom.hourly_revenue    ← 1-minute tumbling window  (revenue per window)
+  ecom.category_metrics  ← 5-minute sliding window   (view/purchase per category)
 
-  Query 2 — action_counts_5min
-    Sliding 5-minute windows (1-minute slide) over view and purchase events.
-    Computes per-category action breakdown.
+Why foreachBatch instead of the native JDBC sink
+─────────────────────────────────────────────────
+  1. The JDBC streaming sink only supports append mode and issues plain
+     INSERT statements — it cannot run ON CONFLICT DO UPDATE upserts.
+  2. foreachBatch exposes each micro-batch as a bounded DataFrame, letting
+     us call any Spark or Python I/O we need.
+  3. psycopg2's execute_values() sends an entire batch in one round-trip,
+     which is far more efficient than one INSERT per row.
 
-Watermark contract
-------------------
-Both queries share a 10-minute event-time watermark.  This means:
+Idempotency guarantee
+─────────────────────
+  INSERT … ON CONFLICT (pk) DO UPDATE SET … (UPSERT) means that if Spark
+  replays a micro-batch on restart (at-least-once delivery), the database
+  converges to the correct value rather than producing duplicates.
 
-  • Spark accepts late events that arrive up to WATERMARK after the maximum
-    observed event_time.  Later arrivals are silently dropped.
-  • Window state is finalised and discarded once the watermark advances past
-    window_end.
-  • With "append" output mode, a row is emitted exactly once — when its
-    window is guaranteed to be complete (i.e. after watermark passes
-    window_end).
+Locking behaviour
+─────────────────
+  ON CONFLICT DO UPDATE takes row-level locks only — no table-level lock.
+  The two queries write to different tables, so they never contend.
 
-Development tip
----------------
-With a 10-minute watermark, the first rows appear roughly 11 minutes after
-the producer starts (1-min window + 10-min watermark).  For faster feedback
-during development set  WATERMARK_DURATION=1 minute  in .env.
+foreachBatch runs on the Spark driver (stream-processor container), not on
+executors, so psycopg2 only needs to be installed there.
 """
 
 import os
 
-from pyspark.sql import SparkSession
+import psycopg2
+import psycopg2.extras
+from pyspark.sql import DataFrame, SparkSession
 from pyspark.sql.functions import (
     col,
     count,
@@ -44,7 +49,7 @@ from pyspark.sql.functions import (
 )
 from pyspark.sql.types import FloatType, StringType, StructField, StructType
 
-# ── Configuration (all overridable via .env / docker-compose environment) ────
+# ── Kafka ──────────────────────────────────────────────────────────────────────
 KAFKA_BOOTSTRAP = os.getenv("KAFKA_BOOTSTRAP_SERVERS",  "kafka:29092")
 TOPIC           = os.getenv("KAFKA_TOPIC_CLICKSTREAM",   "ecom.clickstream")
 TRIGGER_SECS    = os.getenv("TRIGGER_INTERVAL_SECS",     "10")
@@ -54,9 +59,37 @@ ACTIVITY_WIN    = os.getenv("ACTIVITY_WINDOW_DURATION",   "5 minutes")
 ACTIVITY_SLIDE  = os.getenv("ACTIVITY_SLIDE_DURATION",    "1 minute")
 CHECKPOINT_BASE = os.getenv("CHECKPOINT_DIR",             "/tmp/spark-checkpoints")
 
-# ── Schema — must stay in sync with producer/generator.py ─────────────────────
-# timestamp is kept as StringType here; we cast it to TimestampType below so
-# the window() and withWatermark() functions can operate on it correctly.
+# ── PostgreSQL ─────────────────────────────────────────────────────────────────
+PG_HOST = os.getenv("POSTGRES_HOST",     "postgres")
+PG_PORT = int(os.getenv("POSTGRES_PORT", "5432"))
+PG_DB   = os.getenv("POSTGRES_DB",       "ecom_db")
+PG_USER = os.getenv("POSTGRES_USER",     "ecom_user")
+PG_PASS = os.getenv("POSTGRES_PASSWORD", "ecom_pass")
+
+# ── Upsert SQL ─────────────────────────────────────────────────────────────────
+# EXCLUDED.col refers to the value that was rejected by the conflict check.
+# ON CONFLICT DO UPDATE acquires a row-level lock only — no table lock.
+
+REVENUE_UPSERT_SQL = """
+    INSERT INTO ecom.hourly_revenue
+        (window_start, window_end, total_revenue, purchase_count, updated_at)
+    VALUES %s
+    ON CONFLICT (window_start, window_end) DO UPDATE SET
+        total_revenue  = EXCLUDED.total_revenue,
+        purchase_count = EXCLUDED.purchase_count,
+        updated_at     = NOW()
+"""
+
+METRICS_UPSERT_SQL = """
+    INSERT INTO ecom.category_metrics
+        (window_start, window_end, category, action, event_count, updated_at)
+    VALUES %s
+    ON CONFLICT (window_start, window_end, category, action) DO UPDATE SET
+        event_count = EXCLUDED.event_count,
+        updated_at  = NOW()
+"""
+
+# ── Schema (mirrors generator.py) ─────────────────────────────────────────────
 CLICKSTREAM_SCHEMA = StructType([
     StructField("event_id",   StringType(), True),
     StructField("timestamp",  StringType(), True),
@@ -70,28 +103,65 @@ CLICKSTREAM_SCHEMA = StructType([
 ])
 
 
+# ── PostgreSQL helpers ─────────────────────────────────────────────────────────
+
+def pg_connect() -> psycopg2.extensions.connection:
+    """
+    Open a fresh psycopg2 connection pinned to UTC.
+    A new connection per foreachBatch call is intentional — foreachBatch
+    is sequential within a query, so we never hold connections between batches.
+    """
+    return psycopg2.connect(
+        host=PG_HOST,
+        port=PG_PORT,
+        dbname=PG_DB,
+        user=PG_USER,
+        password=PG_PASS,
+        options="-c timezone=UTC",   # ensure timestamps land in UTC
+    )
+
+
+def pg_upsert(rows: list[dict], sql: str, col_order: tuple[str, ...]) -> None:
+    """
+    Bulk-upsert a list of row-dicts into Postgres.
+
+    execute_values() sends all rows as a single multi-row INSERT in one
+    network round-trip — far cheaper than executemany() for large batches.
+    page_size controls how many rows are bundled per VALUES() clause.
+    """
+    tuples = [tuple(row[c] for c in col_order) for row in rows]
+    conn = pg_connect()
+    try:
+        with conn.cursor() as cur:
+            psycopg2.extras.execute_values(cur, sql, tuples, page_size=200)
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+
 # ── Spark session ──────────────────────────────────────────────────────────────
+
 def build_spark() -> SparkSession:
     return (
         SparkSession.builder
         .appName("ecom-windowed-aggregations")
-        # Low shuffle partitions — we have a single Kafka partition in dev
         .config("spark.sql.shuffle.partitions", "4")
         .getOrCreate()
     )
 
 
-# ── Base stream ────────────────────────────────────────────────────────────────
-def read_base_stream(spark: SparkSession):
-    """
-    Read raw Kafka messages, deserialise JSON, and apply the event-time
-    watermark.  Returns a single streaming DataFrame that both aggregation
-    queries consume independently.
+# ── Base stream (shared by both queries) ──────────────────────────────────────
 
-    The ISO-8601 timestamp produced by generator.py
-    (e.g. "2026-07-01T10:00:00.123456+00:00") is converted to a native
-    TimestampType column named event_time using to_timestamp(), which handles
-    timezone offsets automatically in Spark 3.x.
+def read_base_stream(spark: SparkSession) -> DataFrame:
+    """
+    Read raw Kafka messages → parse JSON → cast timestamp → apply watermark.
+
+    Both streaming queries consume this single logical DataFrame.  Spark
+    creates two independent Kafka readers under the hood (one per query),
+    each with its own consumer group and offset tracking.
     """
     raw_df = (
         spark.readStream
@@ -103,53 +173,118 @@ def read_base_stream(spark: SparkSession):
         .load()
     )
 
-    parsed_df = (
+    return (
         raw_df
-        # The Kafka value column is binary — decode to UTF-8 first
         .selectExpr("CAST(value AS STRING) AS json_value")
         .withColumn("event", from_json(col("json_value"), CLICKSTREAM_SCHEMA))
         .select(
-            col("event.event_id"),
             col("event.user_id"),
-            col("event.product_id"),
             col("event.category"),
             col("event.action"),
             col("event.price"),
-            # Cast the ISO-8601 string to a proper timestamp for windowing
+            # to_timestamp handles ISO-8601 strings with timezone offsets (+00:00)
             to_timestamp(col("event.timestamp")).alias("event_time"),
         )
-        # ── Watermark ─────────────────────────────────────────────────────────
-        # Instructs Spark to:
-        #   1. Drop events whose event_time < (max_seen_event_time - WATERMARK)
-        #   2. Finalise window state once the watermark passes window_end
+        # Watermark: Spark drops events that arrive more than WATERMARK after
+        # the maximum observed event_time and frees their window state.
         .withWatermark("event_time", WATERMARK)
     )
-    return parsed_df
 
 
-# ── Query 1: Revenue per 1-minute tumbling window ─────────────────────────────
-def start_revenue_query(base_df):
+# ── foreachBatch writers ───────────────────────────────────────────────────────
+
+def write_revenue_batch(batch_df: DataFrame, batch_id: int) -> None:
     """
-    Groups purchase events into non-overlapping 1-minute tumbling windows and
-    sums the revenue within each window.
+    foreachBatch handler for the revenue query.
 
-    Tumbling windows are defined by window(timeCol, windowDuration).
-    Each event falls into exactly one window.
+    Runs on the Spark driver once per micro-batch trigger.  The batch_df
+    is a bounded (non-streaming) DataFrame containing only the windows that
+    the watermark has finalised since the last trigger.
 
-    Output columns
-    --------------
-    window_start  start of the 1-minute bucket
-    window_end    end   of the 1-minute bucket
-    total_revenue sum of price for all purchases in the window
-    purchase_count number of purchase events
+    Flow:
+      persist → collect to driver → log summary → upsert → unpersist
+    """
+    # persist() so Spark doesn't recompute the batch for collect() and show()
+    batch_df.persist()
+
+    rows = [r.asDict() for r in batch_df.collect()]
+    if not rows:
+        batch_df.unpersist()
+        return
+
+    # ── Console log ──────────────────────────────────────────────────────────
+    print(f"\n{'─'*62}")
+    print(f"  [revenue_per_minute]  batch={batch_id}  windows finalised={len(rows)}")
+    print(f"{'─'*62}")
+    for r in rows:
+        print(
+            f"  {r['window_start']}  →  {r['window_end']}"
+            f"   revenue=${r['total_revenue']:<10.2f}  purchases={r['purchase_count']}"
+        )
+
+    # ── Postgres upsert ───────────────────────────────────────────────────────
+    pg_upsert(
+        rows,
+        REVENUE_UPSERT_SQL,
+        ("window_start", "window_end", "total_revenue", "purchase_count"),
+    )
+    print(f"  ✓ {len(rows)} row(s) upserted → ecom.hourly_revenue")
+
+    batch_df.unpersist()
+
+
+def write_metrics_batch(batch_df: DataFrame, batch_id: int) -> None:
+    """
+    foreachBatch handler for the action-count query.
+
+    Same pattern as write_revenue_batch.  Logs a condensed summary (up to
+    10 lines) to avoid flooding the console — the full result is in Postgres.
+    """
+    batch_df.persist()
+
+    rows = [r.asDict() for r in batch_df.collect()]
+    if not rows:
+        batch_df.unpersist()
+        return
+
+    # ── Console log (condensed) ───────────────────────────────────────────────
+    print(f"\n{'─'*62}")
+    print(f"  [action_counts_5min]  batch={batch_id}  rows finalised={len(rows)}")
+    print(f"{'─'*62}")
+    for r in rows[:10]:                             # show first 10 to avoid spam
+        print(
+            f"  {r['window_start']}  →  {r['window_end']}"
+            f"   {r['category']:<16} {r['action']:<12} count={r['event_count']}"
+        )
+    if len(rows) > 10:
+        print(f"  … and {len(rows) - 10} more rows (see ecom.category_metrics)")
+
+    # ── Postgres upsert ───────────────────────────────────────────────────────
+    pg_upsert(
+        rows,
+        METRICS_UPSERT_SQL,
+        ("window_start", "window_end", "category", "action", "event_count"),
+    )
+    print(f"  ✓ {len(rows)} row(s) upserted → ecom.category_metrics")
+
+    batch_df.unpersist()
+
+
+# ── Windowed aggregations ──────────────────────────────────────────────────────
+
+def start_revenue_query(base_df: DataFrame):
+    """
+    Metric 1 — Total purchase revenue per 1-minute tumbling window.
+
+    Tumbling windows are non-overlapping; each purchase event falls into
+    exactly one window.  Output mode 'append' means Spark emits a row only
+    after the watermark has advanced past window_end — guaranteeing the
+    window will not receive any more late data.
     """
     revenue_df = (
         base_df
-        # Only purchase actions generate revenue
         .filter(col("action") == "purchase")
-        .groupBy(
-            window(col("event_time"), REVENUE_WIN)
-        )
+        .groupBy(window(col("event_time"), REVENUE_WIN))
         .agg(
             _round(_sum("price"), 2).alias("total_revenue"),
             count("*").alias("purchase_count"),
@@ -165,46 +300,31 @@ def start_revenue_query(base_df):
     return (
         revenue_df.writeStream
         .queryName("revenue_per_minute")
-        # append: emit a row only once, when the window is guaranteed complete
         .outputMode("append")
-        .format("console")
-        .option("truncate", "false")
-        .option("numRows", "20")
+        .foreachBatch(write_revenue_batch)
         .trigger(processingTime=f"{TRIGGER_SECS} seconds")
         .option("checkpointLocation", f"{CHECKPOINT_BASE}/revenue_window")
         .start()
     )
 
 
-# ── Query 2: Action counts in 5-minute sliding windows ────────────────────────
-def start_action_counts_query(base_df):
+def start_action_counts_query(base_df: DataFrame):
     """
-    Groups view and purchase events into overlapping 5-minute sliding windows
-    (one new window opens every minute), broken down by category and action.
+    Metric 2 — View and purchase counts per category in 5-minute sliding windows.
 
-    Sliding windows are defined by window(timeCol, windowDuration, slideDuration).
-    Each event falls into (windowDuration / slideDuration) = 5 windows.
-
-    Output columns
-    --------------
-    window_start  start of the 5-minute sliding bucket
-    window_end    end   of the 5-minute sliding bucket
-    category      product category (e.g. Electronics, Clothing)
-    action        "view" or "purchase"
-    event_count   number of events in this window / category / action cell
+    Sliding windows overlap: each event with windowDuration=5m / slideDuration=1m
+    falls into 5 consecutive windows.  This gives a rolling 5-minute picture
+    that updates every minute once windows begin to finalise.
     """
     activity_df = (
         base_df
-        # Restrict to the two actions the metric cares about
         .filter(col("action").isin("view", "purchase"))
         .groupBy(
             window(col("event_time"), ACTIVITY_WIN, ACTIVITY_SLIDE),
             col("category"),
             col("action"),
         )
-        .agg(
-            count("*").alias("event_count"),
-        )
+        .agg(count("*").alias("event_count"))
         .select(
             col("window.start").alias("window_start"),
             col("window.end").alias("window_end"),
@@ -218,9 +338,7 @@ def start_action_counts_query(base_df):
         activity_df.writeStream
         .queryName("action_counts_5min")
         .outputMode("append")
-        .format("console")
-        .option("truncate", "false")
-        .option("numRows", "40")
+        .foreachBatch(write_metrics_batch)
         .trigger(processingTime=f"{TRIGGER_SECS} seconds")
         .option("checkpointLocation", f"{CHECKPOINT_BASE}/action_window")
         .start()
@@ -228,39 +346,36 @@ def start_action_counts_query(base_df):
 
 
 # ── Entry point ────────────────────────────────────────────────────────────────
+
 def main() -> None:
     spark = build_spark()
     spark.sparkContext.setLogLevel("WARN")
 
     print("\n" + "=" * 62)
-    print("  ecom-windowed-aggregations — Day 4")
+    print("  ecom-windowed-aggregations — Day 5 (PostgreSQL sink)")
     print("=" * 62)
-    print(f"  Kafka           : {KAFKA_BOOTSTRAP}  →  {TOPIC}")
-    print(f"  Watermark       : {WATERMARK}")
-    print(f"  Revenue window  : tumbling {REVENUE_WIN}")
-    print(f"  Activity window : sliding {ACTIVITY_WIN} / slide every {ACTIVITY_SLIDE}")
-    print(f"  Trigger         : every {TRIGGER_SECS}s")
+    print(f"  Kafka     : {KAFKA_BOOTSTRAP}  →  {TOPIC}")
+    print(f"  Postgres  : {PG_HOST}:{PG_PORT}/{PG_DB}")
+    print(f"  Watermark : {WATERMARK}  (set WATERMARK_DURATION=1 minute for dev)")
+    print(f"  Revenue   : tumbling {REVENUE_WIN}")
+    print(f"  Activity  : sliding {ACTIVITY_WIN} / slide {ACTIVITY_SLIDE}")
+    print(f"  Trigger   : every {TRIGGER_SECS}s")
     print("=" * 62 + "\n")
 
     base_df = read_base_stream(spark)
 
-    # Print schema once before starting queries
-    print("Base stream schema (post-parse, post-watermark):")
-    base_df.printSchema()
-
     q1 = start_revenue_query(base_df)
     q2 = start_action_counts_query(base_df)
 
-    print(f"[INFO] Query 1 started  →  {q1.name}  ({q1.id})")
-    print(f"[INFO] Query 2 started  →  {q2.name}  ({q2.id})")
+    print(f"[INFO] revenue query  : {q1.name}  id={q1.id}")
+    print(f"[INFO] activity query : {q2.name}  id={q2.id}")
     print(
-        f"\n[NOTE] Output mode is 'append': rows appear only after the watermark\n"
-        f"       advances past window_end.  With WATERMARK_DURATION={WATERMARK},\n"
-        f"       expect the first revenue row ~{WATERMARK} after the first purchase.\n"
-        f"       Lower WATERMARK_DURATION in .env for faster dev feedback.\n"
+        "\n[NOTE] With append output mode, rows are written to Postgres only after\n"
+        f"       the watermark passes window_end.  First writes appear roughly\n"
+        f"       {WATERMARK} after the producer starts sending purchase events.\n"
     )
 
-    # Block until any query fails or is cancelled (Ctrl-C / SIGTERM)
+    # Block until any query errors or the process receives SIGTERM / Ctrl-C
     spark.streams.awaitAnyTermination()
 
 
