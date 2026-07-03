@@ -118,9 +118,11 @@ def _query(sql: str) -> pd.DataFrame:
     conn = None
     try:
         conn = _connect()
-        return pd.read_sql_query(sql, conn)
+        with conn.cursor() as cur:
+            cur.execute(sql)
+            cols = [desc[0] for desc in cur.description]
+            return pd.DataFrame(cur.fetchall(), columns=cols)
     except Exception as exc:
-        # Surface the error in the sidebar so the main layout stays clean
         st.sidebar.error(f"DB error: {exc}")
         return pd.DataFrame()
     finally:
@@ -238,7 +240,7 @@ def chart_revenue(df: pd.DataFrame) -> go.Figure:
             linecolor=BORDER,
             zerolinecolor="rgba(0,0,0,0)",
         ),
-        **_LAYOUT,
+        **{k: v for k, v in _LAYOUT.items() if k != "yaxis"},
     )
     return fig
 
@@ -292,7 +294,7 @@ def chart_categories(df: pd.DataFrame) -> go.Figure:
         xaxis_title="Events",
         yaxis_title=None,
         yaxis=dict(tickfont=dict(size=12), **{k: v for k, v in _LAYOUT["yaxis"].items() if k != "tickfont"}),
-        **_LAYOUT,
+        **{k: v for k, v in _LAYOUT.items() if k != "yaxis"},
     )
     return fig
 
