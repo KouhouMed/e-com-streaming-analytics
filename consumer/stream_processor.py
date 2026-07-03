@@ -33,6 +33,8 @@ foreachBatch runs on the Spark driver (stream-processor container), not on
 executors, so psycopg2 only needs to be installed there.
 """
 
+from __future__ import annotations
+
 import os
 
 import psycopg2
@@ -72,7 +74,7 @@ PG_PASS = os.getenv("POSTGRES_PASSWORD", "ecom_pass")
 
 REVENUE_UPSERT_SQL = """
     INSERT INTO ecom.hourly_revenue
-        (window_start, window_end, total_revenue, purchase_count, updated_at)
+        (window_start, window_end, total_revenue, purchase_count)
     VALUES %s
     ON CONFLICT (window_start, window_end) DO UPDATE SET
         total_revenue  = EXCLUDED.total_revenue,
@@ -82,7 +84,7 @@ REVENUE_UPSERT_SQL = """
 
 METRICS_UPSERT_SQL = """
     INSERT INTO ecom.category_metrics
-        (window_start, window_end, category, action, event_count, updated_at)
+        (window_start, window_end, category, action, event_count)
     VALUES %s
     ON CONFLICT (window_start, window_end, category, action) DO UPDATE SET
         event_count = EXCLUDED.event_count,

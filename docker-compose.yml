@@ -60,7 +60,7 @@ services:
     image: postgres:15-alpine
     container_name: postgres
     ports:
-      - "${POSTGRES_PORT:-5432}:5432"
+      - "${POSTGRES_EXTERNAL_PORT:-5433}:5432"
     environment:
       POSTGRES_USER: "${POSTGRES_USER:-ecom_user}"
       POSTGRES_PASSWORD: "${POSTGRES_PASSWORD:-ecom_pass}"
@@ -83,10 +83,9 @@ services:
       context: ./consumer
       dockerfile: Dockerfile
     container_name: spark-master
-    environment:
-      SPARK_MODE: master
-      SPARK_RPC_AUTHENTICATION_ENABLED: "no"
-      SPARK_RPC_ENCRYPTION_ENABLED: "no"
+    # Use spark-class directly — SPARK_MODE is a Bitnami convention, not used here
+    entrypoint: ["/opt/spark/bin/spark-class"]
+    command: ["org.apache.spark.deploy.master.Master"]
     ports:
       - "${SPARK_MASTER_UI_PORT:-8080}:8080"   # Spark Web UI
       - "7077:7077"                              # Spark master RPC port
@@ -107,13 +106,14 @@ services:
     depends_on:
       spark-master:
         condition: service_healthy
-    environment:
-      SPARK_MODE: worker
-      SPARK_MASTER_URL: "spark://spark-master:7077"
-      SPARK_WORKER_MEMORY: "${SPARK_WORKER_MEMORY:-2G}"
-      SPARK_WORKER_CORES: "${SPARK_WORKER_CORES:-2}"
-      SPARK_RPC_AUTHENTICATION_ENABLED: "no"
-      SPARK_RPC_ENCRYPTION_ENABLED: "no"
+    entrypoint: ["/opt/spark/bin/spark-class"]
+    command:
+      - "org.apache.spark.deploy.worker.Worker"
+      - "spark://spark-master:7077"
+      - "--memory"
+      - "${SPARK_WORKER_MEMORY:-2G}"
+      - "--cores"
+      - "${SPARK_WORKER_CORES:-2}"
     ports:
       - "${SPARK_WORKER_UI_PORT:-8081}:8081"   # Worker Web UI
     restart: unless-stopped
@@ -152,11 +152,14 @@ services:
       POSTGRES_DB:       "${POSTGRES_DB:-ecom_db}"
       POSTGRES_USER:     "${POSTGRES_USER:-ecom_user}"
       POSTGRES_PASSWORD: "${POSTGRES_PASSWORD:-ecom_pass}"
+      PYSPARK_PYTHON:    "python3"
     volumes:
       - ./consumer:/opt/spark/jobs     # mount scripts without rebuild
       - spark_checkpoints:/tmp/spark-checkpoints
-    # Override the bitnami entrypoint to run spark-submit directly
-    entrypoint: ["/opt/bitnami/spark/bin/spark-submit"]
+    # Run as root so the Spark driver can write to the checkpoint volume
+    # (named volumes are created with root ownership; spark user is UID 185)
+    user: "0"
+    entrypoint: ["/opt/spark/bin/spark-submit"]
     command:
       - "--master"
       - "spark://spark-master:7077"
@@ -191,6 +194,9 @@ services:
       DASHBOARD_REFRESH_MS:       "${DASHBOARD_REFRESH_MS:-3000}"
       DASHBOARD_LOOKBACK_MINUTES: "${DASHBOARD_LOOKBACK_MINUTES:-60}"
       DASHBOARD_CATEGORY_WINDOW:  "${DASHBOARD_CATEGORY_WINDOW:-30}"
+    volumes:
+      # Mount app.py so edits take effect on the next Streamlit rerun without rebuild
+      - ./dashboard/app.py:/app/app.py:ro
     ports:
       - "${DASHBOARD_PORT:-8501}:8501"
     restart: unless-stopped

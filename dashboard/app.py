@@ -59,8 +59,8 @@ _LAYOUT = dict(
         yanchor="bottom", y=1.02,
         xanchor="right",  x=1,
     ),
-    xaxis=dict(gridcolor=BORDER, linecolor=BORDER, zerolinecolor="transparent", tickfont=dict(size=11)),
-    yaxis=dict(gridcolor=BORDER, linecolor=BORDER, zerolinecolor="transparent", tickfont=dict(size=11)),
+    xaxis=dict(gridcolor=BORDER, linecolor=BORDER, zerolinecolor="rgba(0,0,0,0)", tickfont=dict(size=11)),
+    yaxis=dict(gridcolor=BORDER, linecolor=BORDER, zerolinecolor="rgba(0,0,0,0)", tickfont=dict(size=11)),
     hoverlabel=dict(bgcolor=SURF, bordercolor=BORDER, font=dict(family=_MONO, size=12)),
 )
 
@@ -226,7 +226,7 @@ def chart_revenue(df: pd.DataFrame) -> go.Figure:
             title_font=dict(color=AMBER, size=11),
             tickprefix="$",
             tickfont=dict(color=AMBER, size=11),
-            **{k: v for k, v in _LAYOUT["yaxis"].items()},
+            **{k: v for k, v in _LAYOUT["yaxis"].items() if k != "tickfont"},
         ),
         yaxis2=dict(
             title="Purchases",
@@ -236,7 +236,7 @@ def chart_revenue(df: pd.DataFrame) -> go.Figure:
             showgrid=False,
             tickfont=dict(color=BLUE, size=11),
             linecolor=BORDER,
-            zerolinecolor="transparent",
+            zerolinecolor="rgba(0,0,0,0)",
         ),
         **_LAYOUT,
     )
@@ -291,7 +291,7 @@ def chart_categories(df: pd.DataFrame) -> go.Figure:
         bargap=0.22,
         xaxis_title="Events",
         yaxis_title=None,
-        yaxis=dict(tickfont=dict(size=12), **{k: v for k, v in _LAYOUT["yaxis"].items()}),
+        yaxis=dict(tickfont=dict(size=12), **{k: v for k, v in _LAYOUT["yaxis"].items() if k != "tickfont"}),
         **_LAYOUT,
     )
     return fig
