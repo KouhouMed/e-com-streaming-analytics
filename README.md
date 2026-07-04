@@ -2,6 +2,8 @@
 
 A 7-day incremental build of a production-grade streaming analytics pipeline using Python, Apache Kafka, PySpark Structured Streaming, PostgreSQL, and Streamlit — every component containerised with Docker Compose.
 
+![Live dashboard](docs/dashboard.png)
+
 ---
 
 ## Architecture
@@ -74,11 +76,17 @@ e-com-streaming-analytics/
 │   ├── requirements.txt
 │   └── generator.py        # Faker clickstream producer
 ├── consumer/
-│   ├── Dockerfile          # bitnami/spark:3.5 + Kafka JARs
+│   ├── Dockerfile          # apache/spark:3.5 + Kafka JARs
 │   ├── requirements.txt
 │   └── stream_processor.py # windowed aggregations → PostgreSQL
-├── aggregator/             # Day 6 (placeholder)
-└── dashboard/              # Day 6–7 (placeholder)
+├── dashboard/
+│   ├── Dockerfile
+│   ├── requirements.txt
+│   ├── app.py              # Streamlit live dashboard
+│   └── .streamlit/
+│       └── config.toml     # dark theme
+└── docs/
+    └── dashboard.png       # screenshot
 ```
 
 ---
@@ -200,7 +208,7 @@ docker exec -i postgres psql -U ecom_user -d ecom_db < db/init.sql
 | 3 | PySpark Structured Streaming baseline — Kafka read + console sink | ✅ Done |
 | 4 | Windowed aggregations — 1-min tumbling revenue · 5-min sliding action counts · 10-min watermark | ✅ Done |
 | 5 | PostgreSQL persistence via `foreachBatch` + psycopg2 upserts | ✅ Done |
-| 6 | Streamlit real-time dashboard — live charts from PostgreSQL | 🔜 Pending |
+| 6 | Streamlit real-time dashboard — live charts from PostgreSQL | ✅ Done |
 | 7 | Polish — alerts, auto-refresh, deployment notes | 🔜 Pending |
 
 ---
