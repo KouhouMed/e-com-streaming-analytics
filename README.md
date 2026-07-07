@@ -28,7 +28,7 @@ A 7-day incremental build of a production-grade streaming analytics pipeline usi
 │                                                   │                 │
 │                                       ┌───────────▼─────────────┐  │
 │                                       │   Streamlit Dashboard   │  │
-│                                       │      (Day 6–7)          │  │
+│                                       │      port 8501          │  │
 │                                       └─────────────────────────┘  │
 └─────────────────────────────────────────────────────────────────────┘
 ```
@@ -58,7 +58,7 @@ A 7-day incremental build of a production-grade streaming analytics pipeline usi
 | Stream processing | PySpark 3.5 Structured Streaming |
 | Storage | PostgreSQL 15 |
 | Orchestration | Docker Compose |
-| Dashboard | Streamlit *(Day 6–7)* |
+| Dashboard | Streamlit |
 
 ---
 
@@ -119,20 +119,20 @@ docker compose logs -f producer
 docker compose logs -f stream-processor
 ```
 
-> **Tip:** Set `WATERMARK_DURATION=1 minute` in `.env` for faster console output during development. With the default 10-minute watermark, aggregated rows first appear in PostgreSQL roughly 11 minutes after the producer starts.
+> **Tip:** The `.env` default for `WATERMARK_DURATION` is `1 minute`, which surfaces data in roughly 2 minutes. If you increase it for production-like behaviour, remember that aggregated rows won't appear until the watermark has advanced past the window end — so a 10-minute watermark means waiting ~11 minutes for first output.
 
 ---
 
 ## Services & Ports
 
-| Service | URL | Purpose |
+| Service | URL / Address | Purpose |
 |---|---|---|
 | Kafka broker | `localhost:9092` | External bootstrap address (host → container) |
-| Spark Master UI | http://localhost:8080 | Cluster overview and running apps |
+| Spark Master UI | http://localhost:8082 | Cluster overview and running apps |
 | Spark Worker UI | http://localhost:8081 | Worker resource usage |
 | Spark App UI | http://localhost:4040 | Active streaming query DAGs |
-| PostgreSQL | `localhost:5432` | OLAP sink (`ecom_db`) |
-| Streamlit *(Day 7)* | http://localhost:8501 | Real-time dashboard |
+| PostgreSQL | `localhost:5433` | OLAP sink (`ecom_db`) — external port |
+| Streamlit dashboard | http://localhost:8501 | Real-time dashboard |
 
 ---
 
@@ -156,8 +156,14 @@ All variables live in `.env` (gitignored). Copy from `.env.example` to get start
 | `POSTGRES_DB` | `ecom_db` | Database name |
 | `POSTGRES_USER` | `ecom_user` | Database user |
 | `POSTGRES_PASSWORD` | `ecom_pass` | Database password |
+| `SPARK_MASTER_UI_PORT` | `8082` | Host port for Spark Master Web UI |
 | `SPARK_WORKER_MEMORY` | `2G` | Memory per Spark worker |
 | `SPARK_WORKER_CORES` | `2` | CPU cores per Spark worker |
+| `POSTGRES_EXTERNAL_PORT` | `5433` | Host-facing PostgreSQL port (avoids conflicts) |
+| `DASHBOARD_PORT` | `8501` | Host port for Streamlit dashboard |
+| `DASHBOARD_REFRESH_MS` | `3000` | Auto-refresh interval in milliseconds |
+| `DASHBOARD_LOOKBACK_MINUTES` | `60` | Revenue chart time window |
+| `DASHBOARD_CATEGORY_WINDOW` | `30` | Category chart time window (minutes) |
 
 ---
 
@@ -209,7 +215,7 @@ docker exec -i postgres psql -U ecom_user -d ecom_db < db/init.sql
 | 4 | Windowed aggregations — 1-min tumbling revenue · 5-min sliding action counts · 10-min watermark | ✅ Done |
 | 5 | PostgreSQL persistence via `foreachBatch` + psycopg2 upserts | ✅ Done |
 | 6 | Streamlit real-time dashboard — live charts from PostgreSQL | ✅ Done |
-| 7 | Polish — alerts, auto-refresh, deployment notes | 🔜 Pending |
+| 7 | End-to-end review — bug fixes, Docker optimisation, comprehensive README | ✅ Done |
 
 ---
 
@@ -231,3 +237,13 @@ Three listeners are configured so containers and the host machine can both reach
 docker compose down          # stop containers, keep volumes (data survives)
 docker compose down -v       # stop containers and delete all volumes (full reset)
 ```
+
+**Wipe only the Spark checkpoints** (useful when the stream-processor keeps crash-looping after a schema change or a broken run):
+
+```bash
+docker run --rm \
+  -v e-com-streaming-analytics_spark_checkpoints:/ckpt \
+  alpine sh -c "rm -rf /ckpt/*"
+```
+
+After wiping, restart the stream-processor: `docker compose restart stream-processor`.

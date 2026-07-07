@@ -1,5 +1,3 @@
-version: "3.8"
-
 # ──────────────────────────────────────────────────────────────────────────────
 # Day 1 — Core infrastructure: Kafka (KRaft, no Zookeeper) + PostgreSQL
 # Day 2 — Clickstream producer (generator.py)

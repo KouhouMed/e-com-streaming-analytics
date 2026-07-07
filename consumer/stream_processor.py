@@ -208,31 +208,30 @@ def write_revenue_batch(batch_df: DataFrame, batch_id: int) -> None:
     """
     # persist() so Spark doesn't recompute the batch for collect() and show()
     batch_df.persist()
+    try:
+        rows = [r.asDict() for r in batch_df.collect()]
+        if not rows:
+            return
 
-    rows = [r.asDict() for r in batch_df.collect()]
-    if not rows:
-        batch_df.unpersist()
-        return
+        # ── Console log ──────────────────────────────────────────────────────
+        print(f"\n{'─'*62}")
+        print(f"  [revenue_per_minute]  batch={batch_id}  windows finalised={len(rows)}")
+        print(f"{'─'*62}")
+        for r in rows:
+            print(
+                f"  {r['window_start']}  →  {r['window_end']}"
+                f"   revenue=${r['total_revenue']:<10.2f}  purchases={r['purchase_count']}"
+            )
 
-    # ── Console log ──────────────────────────────────────────────────────────
-    print(f"\n{'─'*62}")
-    print(f"  [revenue_per_minute]  batch={batch_id}  windows finalised={len(rows)}")
-    print(f"{'─'*62}")
-    for r in rows:
-        print(
-            f"  {r['window_start']}  →  {r['window_end']}"
-            f"   revenue=${r['total_revenue']:<10.2f}  purchases={r['purchase_count']}"
+        # ── Postgres upsert ───────────────────────────────────────────────────
+        pg_upsert(
+            rows,
+            REVENUE_UPSERT_SQL,
+            ("window_start", "window_end", "total_revenue", "purchase_count"),
         )
-
-    # ── Postgres upsert ───────────────────────────────────────────────────────
-    pg_upsert(
-        rows,
-        REVENUE_UPSERT_SQL,
-        ("window_start", "window_end", "total_revenue", "purchase_count"),
-    )
-    print(f"  ✓ {len(rows)} row(s) upserted → ecom.hourly_revenue")
-
-    batch_df.unpersist()
+        print(f"  ✓ {len(rows)} row(s) upserted → ecom.hourly_revenue")
+    finally:
+        batch_df.unpersist()
 
 
 def write_metrics_batch(batch_df: DataFrame, batch_id: int) -> None:
@@ -243,33 +242,32 @@ def write_metrics_batch(batch_df: DataFrame, batch_id: int) -> None:
     10 lines) to avoid flooding the console — the full result is in Postgres.
     """
     batch_df.persist()
+    try:
+        rows = [r.asDict() for r in batch_df.collect()]
+        if not rows:
+            return
 
-    rows = [r.asDict() for r in batch_df.collect()]
-    if not rows:
-        batch_df.unpersist()
-        return
+        # ── Console log (condensed) ───────────────────────────────────────────
+        print(f"\n{'─'*62}")
+        print(f"  [action_counts_5min]  batch={batch_id}  rows finalised={len(rows)}")
+        print(f"{'─'*62}")
+        for r in rows[:10]:                             # show first 10 to avoid spam
+            print(
+                f"  {r['window_start']}  →  {r['window_end']}"
+                f"   {r['category']:<16} {r['action']:<12} count={r['event_count']}"
+            )
+        if len(rows) > 10:
+            print(f"  … and {len(rows) - 10} more rows (see ecom.category_metrics)")
 
-    # ── Console log (condensed) ───────────────────────────────────────────────
-    print(f"\n{'─'*62}")
-    print(f"  [action_counts_5min]  batch={batch_id}  rows finalised={len(rows)}")
-    print(f"{'─'*62}")
-    for r in rows[:10]:                             # show first 10 to avoid spam
-        print(
-            f"  {r['window_start']}  →  {r['window_end']}"
-            f"   {r['category']:<16} {r['action']:<12} count={r['event_count']}"
+        # ── Postgres upsert ───────────────────────────────────────────────────
+        pg_upsert(
+            rows,
+            METRICS_UPSERT_SQL,
+            ("window_start", "window_end", "category", "action", "event_count"),
         )
-    if len(rows) > 10:
-        print(f"  … and {len(rows) - 10} more rows (see ecom.category_metrics)")
-
-    # ── Postgres upsert ───────────────────────────────────────────────────────
-    pg_upsert(
-        rows,
-        METRICS_UPSERT_SQL,
-        ("window_start", "window_end", "category", "action", "event_count"),
-    )
-    print(f"  ✓ {len(rows)} row(s) upserted → ecom.category_metrics")
-
-    batch_df.unpersist()
+        print(f"  ✓ {len(rows)} row(s) upserted → ecom.category_metrics")
+    finally:
+        batch_df.unpersist()
 
 
 # ── Windowed aggregations ──────────────────────────────────────────────────────
@@ -377,8 +375,13 @@ def main() -> None:
         f"       {WATERMARK} after the producer starts sending purchase events.\n"
     )
 
-    # Block until any query errors or the process receives SIGTERM / Ctrl-C
-    spark.streams.awaitAnyTermination()
+    # Block until any query errors or the process receives SIGTERM / Ctrl-C.
+    # The finally block stops the surviving query so it can checkpoint before exit.
+    try:
+        spark.streams.awaitAnyTermination()
+    finally:
+        for q in spark.streams.active:
+            q.stop()
 
 
 if __name__ == "__main__":
